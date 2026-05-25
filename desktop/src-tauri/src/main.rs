@@ -964,7 +964,11 @@ fn open_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn save_audio_file(app: tauri::AppHandle, url: String, filename: String) -> Result<(), String> {
+async fn save_audio_file(
+    app: tauri::AppHandle,
+    url: String,
+    filename: String,
+) -> Result<(), String> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("only http/https URLs are permitted".to_string());
     }
@@ -987,7 +991,10 @@ async fn save_audio_file(app: tauri::AppHandle, url: String, filename: String) -
     if !resp.status().is_success() {
         return Err(format!("backend returned HTTP {}", resp.status()));
     }
-    let bytes = resp.bytes().await.map_err(|e| format!("read failed: {e}"))?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
     std::fs::write(&dest, &bytes).map_err(|e| format!("write failed: {e}"))?;
     Ok(())
 }
@@ -1161,6 +1168,7 @@ async fn download_file_with_progress(
     }
 
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(30 * 60))
         .build()
         .map_err(|e| format!("failed to build HTTP client: {e}"))?;
@@ -1168,7 +1176,13 @@ async fn download_file_with_progress(
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("failed to start download from {url}: {e}"))?;
+        .map_err(|e| {
+            if e.is_connect() || e.is_timeout() {
+                format!("Could not reach the download server. Check your internet connection and try again. ({})", e)
+            } else {
+                format!("failed to start download from {url}: {e}")
+            }
+        })?;
     if !response.status().is_success() {
         return Err(format!(
             "failed to download runtime pack from {url}: HTTP {}",

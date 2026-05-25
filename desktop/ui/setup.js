@@ -92,10 +92,29 @@ async function installRuntimePack(appRoot) {
   const progressWrap = document.getElementById("progress-wrap");
   const progressFill = document.getElementById("progress-fill");
 
+  let lastReceived = 0;
+  let lastProgressAt = Date.now();
+  const STALL_WARN_MS = 30_000;
+
+  const stallTimer = window.setInterval(() => {
+    const stallMs = Date.now() - lastProgressAt;
+    if (stallMs >= STALL_WARN_MS) {
+      setStatus(
+        stallMs >= 60_000
+          ? "Download appears unreachable — check your internet connection and click Retry."
+          : "Download seems slow or stalled — check your internet connection."
+      );
+    }
+  }, 5_000);
+
   const unlisten = await window.__TAURI__.event.listen(
     "runtime-download-progress",
     (event) => {
       const { received, total } = event.payload;
+      if (received !== lastReceived) {
+        lastReceived = received;
+        lastProgressAt = Date.now();
+      }
       const mb = (received / 1e6).toFixed(0);
       if (total && total > 0) {
         const pct = Math.min(100, Math.round((received / total) * 100));
@@ -128,7 +147,21 @@ async function installRuntimePack(appRoot) {
     if (!verified) {
       progressWrap.classList.remove("hidden");
       setStatus("Downloading StemDeck runtime...");
-      await invoke("download_runtime_pack");
+      const stopSlowMsg = startProgressStatus([
+        { afterSeconds: 0,  text: "Downloading StemDeck runtime..." },
+        { afterSeconds: 30, text: "Still downloading runtime... slow connection detected." },
+        { afterSeconds: 90, text: "Still downloading... large file on a slow connection can take a few minutes." },
+      ]);
+      try {
+        await invoke("download_runtime_pack");
+      } catch (err) {
+        throw Object.assign(
+          new Error(String(err)),
+          { hint: "Check your internet connection and click Retry. If the problem persists, try a different network." }
+        );
+      } finally {
+        stopSlowMsg();
+      }
       progressWrap.classList.add("hidden");
       setStatus("Verifying StemDeck runtime...");
       await invoke("verify_runtime_pack");
@@ -142,6 +175,7 @@ async function installRuntimePack(appRoot) {
       );
     }
   } finally {
+    window.clearInterval(stallTimer);
     unlisten();
     progressWrap.classList.add("hidden");
   }
