@@ -24,10 +24,39 @@ const DEFAULT_MACOS_FFMPEG_URL: &str = "https://evermeet.cx/ffmpeg/getrelease/ff
 #[cfg(target_os = "macos")]
 const DEFAULT_MACOS_FFPROBE_URL: &str = "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip";
 
-#[derive(Default)]
+struct BackendHandles {
+    child: Child,
+    url: String,
+}
+
+struct BackendStateInner {
+    handles: Option<BackendHandles>,
+    /// True while start_backend is executing; prevents concurrent starts (#145).
+    starting: bool,
+    /// PID of an in-progress pip subprocess; killed by stop_backend on window close (#140).
+    pip_pid: Option<u32>,
+}
+
+impl Default for BackendStateInner {
+    fn default() -> Self {
+        BackendStateInner {
+            handles: None,
+            starting: false,
+            pip_pid: None,
+        }
+    }
+}
+
 struct BackendState {
-    child: Mutex<Option<Child>>,
-    url: Mutex<Option<String>>,
+    inner: Mutex<BackendStateInner>,
+}
+
+impl Default for BackendState {
+    fn default() -> Self {
+        BackendState {
+            inner: Mutex::new(BackendStateInner::default()),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -456,101 +485,123 @@ fn start_backend(
     app_handle: tauri::AppHandle,
     state: tauri::State<BackendState>,
 ) -> Result<BackendStarted, String> {
-    if let Some(url) = state.url.lock().map_err(|e| e.to_string())?.clone() {
-        return Ok(BackendStarted { url });
-    }
-    stop_backend(&state);
-
-    let root = app_root()?;
-    let backend_dir = backend_dir(&root)?;
-    let data_dir = local_data_dir()?;
-    let python = python_path(&root).filter(|p| p.is_file()).ok_or_else(|| {
-        "Python runtime not found. Expected python/ or .venv/ under StemDeck.".to_string()
-    })?;
-    patch_pyvenv_cfg(&python);
-    let (port, port_guard) = free_port()?;
-    let url = format!("http://127.0.0.1:{port}");
-    let log_path = data_dir.join("logs").join("backend.log");
-    let (stdout, stderr) = prepare_backend_stdio(&log_path).unwrap_or_else(|_| {
-        // Logging should help diagnose startup; it should not prevent startup.
-        (Stdio::null(), Stdio::null())
-    });
-
-    // On macOS, python-build-standalone detects its own prefix by walking up from
-    // bin/ — PYTHONHOME is not needed and actively breaks startup when mis-computed.
-    // On Windows the venv launcher needs PYTHONHOME to locate the bundled stdlib.
-    // Compute before moving python into Command::new.
-    #[cfg(not(target_os = "macos"))]
-    let pythonhome = python
-        .parent()
-        .and_then(|bin_dir| bin_dir.parent().map(|venv| (venv, bin_dir)))
-        .and_then(|(venv, bin_dir)| bundled_python_home(venv, bin_dir).map(|(home, _)| home));
-
-    let mut cmd = Command::new(python);
-    cmd.args([
-        "-m",
-        "uvicorn",
-        "app.main:app",
-        "--host",
-        "127.0.0.1",
-        "--port",
-        &port.to_string(),
-    ]);
-    #[cfg(not(target_os = "macos"))]
-    if let Some(ref pythonhome) = pythonhome {
-        cmd.env("PYTHONHOME", pythonhome);
-    }
-
-    // Jobs (stem audio files) live in ~/Documents/StemDeck/jobs/ so the user's
-    // library is visible in Finder, backed up by iCloud, and survives app reinstalls.
-    let jobs_dir = documents_dir_for_jobs(&app_handle);
-
-    cmd.current_dir(&backend_dir)
-        .env("STEMDECK_DATA_DIR", &data_dir)
-        .env("STEMDECK_JOBS_DIR", &jobs_dir)
-        .env("STEMDECK_DESKTOP", "1")
-        .env("STEMDECK_PARENT_PID", std::process::id().to_string())
-        .env("PYTHONUNBUFFERED", "1")
-        .env("XDG_CACHE_HOME", data_dir.join("cache"))
-        .env("TORCH_HOME", data_dir.join("models").join("torch"))
-        .stdout(stdout)
-        .stderr(stderr);
-
-    if let Some(ffmpeg_dir) = ffmpeg_dir_if_present(&data_dir) {
-        let existing = env::var_os("PATH").unwrap_or_default();
-        let mut paths = vec![ffmpeg_dir];
-        paths.extend(env::split_paths(&existing));
-        let joined = env::join_paths(paths).map_err(|e| e.to_string())?;
-        cmd.env("PATH", joined);
-    }
-
-    #[cfg(windows)]
+    // Gate concurrent calls: return immediately if already running or starting (#145).
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+        let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
+        if let Some(ref h) = inner.handles {
+            return Ok(BackendStarted { url: h.url.clone() });
+        }
+        if inner.starting {
+            return Err("Backend startup already in progress".to_string());
+        }
+        inner.starting = true;
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to start backend: {e}"))?;
-    // Release the reserved port immediately after spawn so uvicorn can bind it.
-    drop(port_guard);
+    // Spawn and wait for health outside the lock; update state atomically on completion.
+    let spawn_result = (|| {
+        let root = app_root()?;
+        let backend_dir = backend_dir(&root)?;
+        let data_dir = local_data_dir()?;
+        let python = python_path(&root).filter(|p| p.is_file()).ok_or_else(|| {
+            "Python runtime not found. Expected python/ or .venv/ under StemDeck.".to_string()
+        })?;
+        patch_pyvenv_cfg(&python);
+        let (port, port_guard) = free_port()?;
+        let url = format!("http://127.0.0.1:{port}");
+        let log_path = data_dir.join("logs").join("backend.log");
+        let (stdout, stderr) = prepare_backend_stdio(&log_path).unwrap_or_else(|_| {
+            // Logging should help diagnose startup; it should not prevent startup.
+            (Stdio::null(), Stdio::null())
+        });
 
-    if let Err(err) = wait_for_health(port, Duration::from_secs(90), &log_path) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(err);
+        // On macOS, python-build-standalone detects its own prefix by walking up from
+        // bin/ — PYTHONHOME is not needed and actively breaks startup when mis-computed.
+        // On Windows the venv launcher needs PYTHONHOME to locate the bundled stdlib.
+        // Compute before moving python into Command::new.
+        #[cfg(not(target_os = "macos"))]
+        let pythonhome = python
+            .parent()
+            .and_then(|bin_dir| bin_dir.parent().map(|venv| (venv, bin_dir)))
+            .and_then(|(venv, bin_dir)| bundled_python_home(venv, bin_dir).map(|(home, _)| home));
+
+        let mut cmd = Command::new(python);
+        cmd.args([
+            "-m",
+            "uvicorn",
+            "app.main:app",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+        ]);
+        #[cfg(not(target_os = "macos"))]
+        if let Some(ref pythonhome) = pythonhome {
+            cmd.env("PYTHONHOME", pythonhome);
+        }
+
+        // Jobs (stem audio files) live in ~/Documents/StemDeck/jobs/ so the user's
+        // library is visible in Finder, backed up by iCloud, and survives app reinstalls.
+        let jobs_dir = documents_dir_for_jobs(&app_handle);
+
+        cmd.current_dir(&backend_dir)
+            .env("STEMDECK_DATA_DIR", &data_dir)
+            .env("STEMDECK_JOBS_DIR", &jobs_dir)
+            .env("STEMDECK_DESKTOP", "1")
+            .env("STEMDECK_PARENT_PID", std::process::id().to_string())
+            .env("PYTHONUNBUFFERED", "1")
+            .env("XDG_CACHE_HOME", data_dir.join("cache"))
+            .env("TORCH_HOME", data_dir.join("models").join("torch"))
+            .stdout(stdout)
+            .stderr(stderr);
+
+        if let Some(ffmpeg_dir) = ffmpeg_dir_if_present(&data_dir) {
+            let existing = env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![ffmpeg_dir];
+            paths.extend(env::split_paths(&existing));
+            let joined = env::join_paths(paths).map_err(|e| e.to_string())?;
+            cmd.env("PATH", joined);
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to start backend: {e}"))?;
+        // Release the reserved port immediately after spawn so uvicorn can bind it.
+        drop(port_guard);
+
+        if let Err(err) = wait_for_health(port, Duration::from_secs(90), &log_path) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+
+        Ok((child, url))
+    })();
+
+    // Atomically update state: clear starting flag whether spawn succeeded or failed.
+    let mut inner = state.inner.lock().map_err(|e| e.to_string())?;
+    inner.starting = false;
+    match spawn_result {
+        Ok((child, url)) => {
+            inner.handles = Some(BackendHandles {
+                child,
+                url: url.clone(),
+            });
+            Ok(BackendStarted { url })
+        }
+        Err(e) => Err(e),
     }
-
-    *state.child.lock().map_err(|e| e.to_string())? = Some(child);
-    *state.url.lock().map_err(|e| e.to_string())? = Some(url.clone());
-    Ok(BackendStarted { url })
 }
 
 /// Detects GPU hardware, installs CUDA torch if needed, and persists the chosen device.
 #[tauri::command]
-fn ensure_torch_device() -> Result<GpuSetup, String> {
+fn ensure_torch_device(state: tauri::State<BackendState>) -> Result<GpuSetup, String> {
     let root = app_root()?;
     let data_dir = local_data_dir()?;
 
@@ -594,7 +645,7 @@ fn ensure_torch_device() -> Result<GpuSetup, String> {
         let setup = match detect_nvidia_gpu() {
             Some((gpu_name, cuda_version)) => {
                 let index_url = cuda_index_url(&cuda_version);
-                install_cuda_torch(&python, &index_url)?;
+                install_cuda_torch(&python, &index_url, &state)?;
                 let cuda_verified = verify_cuda_torch(&python);
                 GpuSetup {
                     gpu_detected: true,
@@ -911,7 +962,7 @@ fn classify_cuda_install_error(stderr: &str) -> String {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn install_cuda_torch(python: &Path, index_url: &str) -> Result<(), String> {
+fn install_cuda_torch(python: &Path, index_url: &str, state: &BackendState) -> Result<(), String> {
     // Skip only when CUDA torch is already active — torch.version.cuda is
     // None for CPU-only wheels, so this correctly re-installs when needed.
     if verify_cuda_torch(python) {
@@ -946,8 +997,22 @@ fn install_cuda_torch(python: &Path, index_url: &str) -> Result<(), String> {
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+
+    let child = command
+        .spawn()
+        .map_err(|e| format!("failed to start CUDA torch install: {e}"))?;
+
+    // Track the pip PID so stop_backend can kill it if the window is closed
+    // while CUDA torch is installing, preventing venv corruption (#140).
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.pip_pid = Some(child.id());
+    }
     let output =
-        command_output_with_timeout(command, Duration::from_secs(20 * 60), "CUDA torch install")?;
+        child_output_with_timeout(child, Duration::from_secs(20 * 60), "CUDA torch install");
+    if let Ok(mut inner) = state.inner.lock() {
+        inner.pip_pid = None;
+    }
+    let output = output?;
 
     if output.status.success() {
         Ok(())
@@ -1082,29 +1147,42 @@ async fn save_audio_file(
 }
 
 fn stop_backend(state: &BackendState) {
-    if let Ok(mut guard) = state.child.lock() {
-        if let Some(child) = guard.as_mut() {
-            // Send SIGTERM first so uvicorn can drain in-progress requests
-            // before we escalate to SIGKILL.
-            #[cfg(unix)]
-            {
-                // SAFETY: child was spawned by us and has not yet been waited on;
-                // its PID is valid for the lifetime of the Child handle.
-                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while Instant::now() < deadline {
-                    if child.try_wait().ok().flatten().is_some() {
-                        *guard = None;
-                        return;
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        *guard = None;
+    let (handles, pip_pid) = match state.inner.lock() {
+        Ok(mut guard) => (guard.handles.take(), guard.pip_pid.take()),
+        Err(_) => return,
+    };
+
+    // Kill any in-progress pip subprocess so it doesn't corrupt the venv
+    // if the window is closed during CUDA torch installation (#140).
+    #[cfg(unix)]
+    if let Some(pid) = pip_pid {
+        // SAFETY: pid was stored immediately after spawn; we send SIGTERM best-effort.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     }
+
+    let Some(mut handles) = handles else { return };
+
+    // Drain the backend on a background thread so we don't block the Tauri
+    // RunEvent main thread for up to 3 seconds (#144).
+    thread::spawn(move || {
+        // Send SIGTERM first so uvicorn can drain in-progress requests
+        // before we escalate to SIGKILL.
+        #[cfg(unix)]
+        {
+            // SAFETY: child was spawned by us and has not yet been waited on;
+            // its PID is valid for the lifetime of the Child handle.
+            unsafe { libc::kill(handles.child.id() as libc::pid_t, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if handles.child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+        let _ = handles.child.kill();
+        let _ = handles.child.wait();
+    });
 }
 
 /// Returns the persistent user data directory for StemDeck.
@@ -1961,6 +2039,46 @@ fn update_setup_config<const N: usize>(
     drop(tmp_file);
     fs::rename(&tmp_path, &config_path)
         .map_err(|e| format!("failed to move config to {}: {e}", config_path.display()))
+}
+
+/// Polls an already-spawned child until it exits or the timeout elapses.
+/// Mirrors command_output_with_timeout but accepts a pre-spawned Child so the
+/// caller can record the PID before waiting (e.g. to kill on window close).
+fn child_output_with_timeout(
+    mut child: Child,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("failed to wait for {label}: {e}"))?
+        {
+            let mut stdout = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                let _ = pipe.read_to_end(&mut stdout);
+            }
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_end(&mut stderr);
+            }
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "{label} timed out after {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn command_output_with_timeout(
