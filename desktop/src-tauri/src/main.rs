@@ -1349,12 +1349,16 @@ async fn download_file_with_progress(
         fs::remove_file(&tmp).map_err(|e| format!("failed to remove {}: {e}", tmp.display()))?;
     }
 
+    // file:// and bare-path shortcuts are development-only; not available in
+    // release builds so a compromised manifest cannot bypass the download (#136).
+    #[cfg(debug_assertions)]
     if let Some(path) = url.strip_prefix("file://") {
         fs::copy(Path::new(path), &tmp)
             .map_err(|e| format!("failed to copy runtime pack from {url}: {e}"))?;
         return fs::rename(&tmp, target)
             .map_err(|e| format!("failed to move runtime pack to {}: {e}", target.display()));
     }
+    #[cfg(debug_assertions)]
     if Path::new(url).is_file() {
         fs::copy(Path::new(url), &tmp)
             .map_err(|e| format!("failed to copy runtime pack from {url}: {e}"))?;
@@ -1432,13 +1436,23 @@ fn download_file(url: &str, target: &Path, timeout: Duration) -> Result<(), Stri
         fs::remove_file(&tmp).map_err(|e| format!("failed to remove {}: {e}", tmp.display()))?;
     }
 
+    // file:// and bare-path shortcuts are development-only (#136).
+    #[cfg(debug_assertions)]
     if let Some(path) = url.strip_prefix("file://") {
         fs::copy(Path::new(path), &tmp)
             .map_err(|e| format!("failed to copy runtime pack from {url}: {e}"))?;
-    } else if Path::new(url).is_file() {
+        return fs::rename(&tmp, target)
+            .map_err(|e| format!("failed to move runtime pack to {}: {e}", target.display()));
+    }
+    #[cfg(debug_assertions)]
+    if Path::new(url).is_file() {
         fs::copy(Path::new(url), &tmp)
             .map_err(|e| format!("failed to copy runtime pack from {url}: {e}"))?;
-    } else {
+        return fs::rename(&tmp, target)
+            .map_err(|e| format!("failed to move runtime pack to {}: {e}", target.display()));
+    }
+
+    {
         let mut command = Command::new("curl");
         command
             .args([
@@ -1776,22 +1790,54 @@ fn ensure_ffmpeg(data_dir: &Path) -> Result<PathBuf, String> {
 
 #[cfg(target_os = "macos")]
 fn download_macos_ffmpeg(data_dir: &Path) -> Result<(), String> {
-    let ffmpeg_url = env::var("STEMDECK_FFMPEG_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let ffmpeg_url = env_path_override("STEMDECK_FFMPEG_URL")
+        .map(|p| p.display().to_string())
         .unwrap_or_else(|| DEFAULT_MACOS_FFMPEG_URL.to_string());
-    let ffprobe_url = env::var("STEMDECK_FFPROBE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let ffprobe_url = env_path_override("STEMDECK_FFPROBE_URL")
+        .map(|p| p.display().to_string())
         .unwrap_or_else(|| DEFAULT_MACOS_FFPROBE_URL.to_string());
+    let using_defaults =
+        ffmpeg_url == DEFAULT_MACOS_FFMPEG_URL && ffprobe_url == DEFAULT_MACOS_FFPROBE_URL;
+
     let downloads = data_dir.join("downloads");
     let ffmpeg_zip = downloads.join("ffmpeg-macos.zip");
     let ffprobe_zip = downloads.join("ffprobe-macos.zip");
     fs::create_dir_all(&downloads)
         .map_err(|e| format!("failed to create {}: {e}", downloads.display()))?;
 
+    // Fetch expected checksums from evermeet.cx before downloading (#135).
+    // Only verified when using the default evermeet.cx URLs.
+    let (ffmpeg_checksum, ffprobe_checksum) = if using_defaults {
+        let fc = fetch_evermeet_checksum("ffmpeg", Duration::from_secs(30))?;
+        let pc = fetch_evermeet_checksum("ffprobe", Duration::from_secs(30))?;
+        (Some(fc), Some(pc))
+    } else {
+        (None, None)
+    };
+
     download_file(&ffmpeg_url, &ffmpeg_zip, Duration::from_secs(30 * 60))?;
+    if let Some(expected) = ffmpeg_checksum {
+        let actual = sha256_file(&ffmpeg_zip)?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            let _ = fs::remove_file(&ffmpeg_zip);
+            return Err(format!(
+                "FFmpeg archive checksum mismatch (expected {expected}, got {actual}). \
+                 Click Retry to try again."
+            ));
+        }
+    }
+
     download_file(&ffprobe_url, &ffprobe_zip, Duration::from_secs(30 * 60))?;
+    if let Some(expected) = ffprobe_checksum {
+        let actual = sha256_file(&ffprobe_zip)?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            let _ = fs::remove_file(&ffprobe_zip);
+            return Err(format!(
+                "ffprobe archive checksum mismatch (expected {expected}, got {actual}). \
+                 Click Retry to try again."
+            ));
+        }
+    }
 
     let ffmpeg_dir = data_dir.join("ffmpeg");
     fs::create_dir_all(&ffmpeg_dir)
@@ -1802,6 +1848,42 @@ fn download_macos_ffmpeg(data_dir: &Path) -> Result<(), String> {
     make_executable(&ffmpeg_dir.join("ffmpeg"))?;
     make_executable(&ffmpeg_dir.join("ffprobe"))?;
     Ok(())
+}
+
+/// Fetches the SHA-256 checksum for an evermeet.cx FFmpeg binary via their info API.
+/// Returns the lowercase hex string from the `checksum` field.
+#[cfg(target_os = "macos")]
+fn fetch_evermeet_checksum(binary: &str, timeout: Duration) -> Result<String, String> {
+    let info_url = format!("https://evermeet.cx/ffmpeg/info/{binary}/zip");
+    let mut command = Command::new("curl");
+    command
+        .args([
+            "--fail",
+            "--location",
+            "--show-error",
+            "--silent",
+            "--",
+            &info_url,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output =
+        command_output_with_timeout(command, timeout, &format!("{binary} checksum fetch"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "failed to fetch {binary} checksum: {}",
+            stderr.trim()
+        ));
+    }
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("failed to parse {binary} checksum JSON: {e}"))?;
+    let checksum = json
+        .get("checksum")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("checksum field missing from {binary} info response"))?
+        .to_ascii_lowercase();
+    Ok(checksum)
 }
 
 #[cfg(target_os = "macos")]
@@ -1864,16 +1946,46 @@ fn make_executable(path: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn download_windows_ffmpeg(data_dir: &Path) -> Result<(), String> {
-    let url = env::var("STEMDECK_FFMPEG_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let url = env_path_override("STEMDECK_FFMPEG_URL")
+        .map(|p| p.display().to_string())
         .unwrap_or_else(|| DEFAULT_WINDOWS_FFMPEG_URL.to_string());
+    let is_default_url = url == DEFAULT_WINDOWS_FFMPEG_URL;
     let downloads = data_dir.join("downloads");
     let archive_path = downloads.join("ffmpeg-windows.zip");
     fs::create_dir_all(&downloads)
         .map_err(|e| format!("failed to create {}: {e}", downloads.display()))?;
 
+    // Fetch the SHA256 companion file from gyan.dev before downloading the archive (#135).
+    // Only verified for the default URL; custom overrides skip the check.
+    let expected_sha256 = if is_default_url {
+        let sha256_url = format!("{url}.sha256");
+        let sha256_tmp = downloads.join("ffmpeg-windows.zip.sha256");
+        download_file_blocking(&sha256_url, &sha256_tmp)?;
+        let raw = fs::read_to_string(&sha256_tmp)
+            .map_err(|e| format!("failed to read FFmpeg SHA256: {e}"))?;
+        let _ = fs::remove_file(&sha256_tmp);
+        Some(
+            raw.split_whitespace()
+                .next()
+                .ok_or_else(|| "FFmpeg SHA256 file was empty".to_string())?
+                .to_ascii_lowercase(),
+        )
+    } else {
+        None
+    };
+
     download_file_blocking(&url, &archive_path)?;
+
+    if let Some(expected) = expected_sha256 {
+        let actual = sha256_file(&archive_path)?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            let _ = fs::remove_file(&archive_path);
+            return Err(format!(
+                "FFmpeg archive checksum mismatch (expected {expected}, got {actual}). \
+                 The download may be corrupt. Click Retry to try again."
+            ));
+        }
+    }
 
     extract_ffmpeg_binaries(&archive_path, data_dir)
 }
