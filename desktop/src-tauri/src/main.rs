@@ -431,8 +431,18 @@ fn extract_runtime_pack() -> Result<RuntimePackStatus, String> {
             .map_err(|e| format!("failed to move existing runtime aside: {e}"))?;
     }
     fs::rename(&extracted, &runtime).map_err(|e| format!("failed to install runtime: {e}"))?;
-    let _ = fs::remove_dir_all(&tmp);
-    let _ = fs::remove_dir_all(&old);
+
+    // Cleanup is non-fatal; log warnings rather than silently discarding errors.
+    if let Err(e) = fs::remove_dir_all(&tmp) {
+        if let Ok(d) = local_data_dir() {
+            append_to_setup_log(&d, &format!("cleanup warning: {}: {e}", tmp.display()));
+        }
+    }
+    if let Err(e) = fs::remove_dir_all(&old) {
+        if let Ok(d) = local_data_dir() {
+            append_to_setup_log(&d, &format!("cleanup warning: {}: {e}", old.display()));
+        }
+    }
 
     let python = runtime.join("python").join("bin").join("python");
     patch_pyvenv_cfg(&python);
@@ -444,6 +454,18 @@ fn extract_runtime_pack() -> Result<RuntimePackStatus, String> {
 fn ensure_workspace() -> Result<(), String> {
     let root = app_root()?;
     let data = local_data_dir()?;
+
+    // Recover from an interrupted runtime swap: if runtime/ is absent but
+    // runtime.old/ exists, a previous extract_runtime_pack was killed between
+    // the two rename steps. Restore the previous install so setup can retry.
+    {
+        let runtime_path = runtime_dir(&data);
+        let old_path = data.join("runtime.old");
+        if !runtime_path.exists() && old_path.is_dir() {
+            let _ = fs::rename(&old_path, &runtime_path);
+        }
+    }
+
     migrate_legacy_data(&root, &data);
     fs::create_dir_all(&data).map_err(|e| format!("failed to create data dir: {e}"))?;
     for dir in ["cache", "downloads", "ffmpeg", "jobs", "logs", "models"] {
@@ -1221,6 +1243,17 @@ fn local_data_dir() -> Result<PathBuf, String> {
     }
 }
 
+/// Appends a timestamped line to data/logs/setup.log (best-effort; never fails the caller).
+fn append_to_setup_log(data_dir: &Path, msg: &str) {
+    let log = data_dir.join("logs").join("setup.log");
+    if let Some(p) = log.parent() {
+        let _ = fs::create_dir_all(p);
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&log) {
+        let _ = writeln!(f, "[stemdeck] {msg}");
+    }
+}
+
 /// One-time migration: move legacy data/models/jobs/ffmpeg from the install
 /// directory into the new per-user data directory on the user's first launch
 /// after upgrading to a version that uses local_data_dir().
@@ -1567,10 +1600,18 @@ fn backend_dir(root: &Path) -> Result<PathBuf, String> {
     ))
 }
 
+/// Returns Some(PathBuf) if the env var is set and non-empty, None otherwise.
+fn env_path_override(var: &str) -> Option<PathBuf> {
+    env::var(var)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
 fn python_path(root: &Path) -> Option<PathBuf> {
     #[cfg(debug_assertions)]
-    if let Ok(path) = env::var("STEMDECK_PYTHON") {
-        return Some(PathBuf::from(path));
+    if let Some(p) = env_path_override("STEMDECK_PYTHON") {
+        return Some(p);
     }
     if let Ok(data_dir) = local_data_dir() {
         let python = runtime_python_path(&data_dir);
@@ -1597,8 +1638,8 @@ fn python_path(root: &Path) -> Option<PathBuf> {
 }
 
 fn ffmpeg_path(data_dir: &Path) -> Option<PathBuf> {
-    if let Ok(path) = env::var("STEMDECK_FFMPEG") {
-        return Some(PathBuf::from(path));
+    if let Some(p) = env_path_override("STEMDECK_FFMPEG") {
+        return Some(p);
     }
     let file = if cfg!(windows) {
         "ffmpeg.exe"
