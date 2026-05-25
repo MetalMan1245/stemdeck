@@ -872,6 +872,45 @@ fn python_stdlib_present(venv_root: &Path) -> bool {
         .any(|entry| entry.path().join("os.py").is_file())
 }
 
+/// Maps known pip/OS failure patterns to actionable user messages.
+/// Pure function — caller is responsible for logging the raw stderr before calling.
+fn classify_cuda_install_error(stderr: &str) -> String {
+    let lower = stderr.to_ascii_lowercase();
+
+    if lower.contains("missing dependencies for socks") || lower.contains("pysocks") {
+        return "CUDA install failed: a SOCKS proxy is active on your system. \
+                Disable it temporarily and click Retry."
+            .to_string();
+    }
+    if lower.contains("no space left on device")
+        || lower.contains("not enough space on the disk")
+        || lower.contains("disk quota exceeded")
+    {
+        return "CUDA install failed: not enough disk space. Free up space and click Retry."
+            .to_string();
+    }
+    if lower.contains("access is denied") || lower.contains("permissionerror") {
+        return "CUDA install failed: permission denied — antivirus software may be blocking \
+                the install. Try adding StemDeck to your AV exclusions and click Retry."
+            .to_string();
+    }
+    if lower.contains("could not connect") || lower.contains("connection timed out") {
+        return "CUDA install failed: could not reach download.pytorch.org. \
+                Check your internet connection and click Retry."
+            .to_string();
+    }
+
+    // Unknown error — strip pip version-check noise, surface remaining stderr
+    let cleaned = stderr
+        .lines()
+        .filter(|l| {
+            !l.starts_with("WARNING: There was an error checking the latest version of pip")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("CUDA torch install failed: {}", cleaned.trim())
+}
+
 #[cfg(not(target_os = "macos"))]
 fn install_cuda_torch(python: &Path, index_url: &str) -> Result<(), String> {
     // Skip only when CUDA torch is already active — torch.version.cuda is
@@ -915,7 +954,27 @@ fn install_cuda_torch(python: &Path, index_url: &str) -> Result<(), String> {
         Ok(())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("CUDA torch install failed: {}", stderr.trim()))
+        // Write full stderr to setup.log before mapping — eprintln! is silent in
+        // GUI mode on Windows (no console), so file logging is the only reliable
+        // diagnostic path in the deployed app.
+        if let Ok(data_dir) = local_data_dir() {
+            let log_path = data_dir.join("logs").join("setup.log");
+            if let Some(parent) = log_path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = writeln!(
+                    f,
+                    "[stemdeck] CUDA torch install failed. stderr:\n{}",
+                    stderr.trim()
+                );
+            }
+        }
+        Err(classify_cuda_install_error(&stderr))
     }
 }
 
@@ -1006,6 +1065,8 @@ fn stop_backend(state: &BackendState) {
             // before we escalate to SIGKILL.
             #[cfg(unix)]
             {
+                // SAFETY: child was spawned by us and has not yet been waited on;
+                // its PID is valid for the lifetime of the Child handle.
                 unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
                 let deadline = Instant::now() + Duration::from_secs(3);
                 while Instant::now() < deadline {
@@ -1663,44 +1724,63 @@ fn download_windows_ffmpeg(data_dir: &Path) -> Result<(), String> {
     fs::create_dir_all(&downloads)
         .map_err(|e| format!("failed to create {}: {e}", downloads.display()))?;
 
-    download_file_with_powershell(&url, &archive_path)?;
+    download_file_blocking(&url, &archive_path)?;
 
     extract_ffmpeg_binaries(&archive_path, data_dir)
 }
 
 #[cfg(windows)]
-fn download_file_with_powershell(url: &str, target: &Path) -> Result<(), String> {
-    let target_str = target.display().to_string();
-    // Pass URL and destination via environment variables to avoid quote injection
-    // in the PowerShell -Command string (a URL with a single quote would break
-    // the original string-interpolation approach).
-    let script = "$ProgressPreference = 'SilentlyContinue'; \
-         Invoke-WebRequest -Uri $env:STEMDECK_DL_URL -OutFile $env:STEMDECK_DL_DEST";
-    let mut command = Command::new("powershell.exe");
-    command
-        .args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .env("STEMDECK_DL_URL", url)
-        .env("STEMDECK_DL_DEST", &target_str)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    hide_console_window(&mut command);
-    let output =
-        command_output_with_timeout(command, Duration::from_secs(30 * 60), "FFmpeg download")?;
-    if output.status.success() && target.is_file() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "failed to download FFmpeg from {url}: {}",
-            stderr.trim()
-        ))
+fn download_file_blocking(url: &str, target: &Path) -> Result<(), String> {
+    let tmp = target.with_extension("download");
+    if tmp.exists() {
+        fs::remove_file(&tmp).map_err(|e| format!("failed to remove {}: {e}", tmp.display()))?;
     }
+
+    // NOTE: do not call this function from an async context — reqwest::blocking
+    // spawns its own tokio runtime and will panic with "Cannot start a runtime
+    // from within a runtime" if a tokio executor is already running on the thread.
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30 * 60))
+        .build()
+        .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+    let mut response = client.get(url).send().map_err(|e| {
+        if e.is_connect() || e.is_timeout() {
+            format!(
+                "Could not reach the download server. \
+                 Check your internet connection and try again. ({e})"
+            )
+        } else {
+            format!("failed to start download from {url}: {e}")
+        }
+    })?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "failed to download from {url}: HTTP {}",
+            response.status()
+        ));
+    }
+
+    let mut file =
+        fs::File::create(&tmp).map_err(|e| format!("failed to create {}: {e}", tmp.display()))?;
+
+    response
+        .copy_to(&mut file)
+        .map_err(|e| format!("failed to write to {}: {e}", tmp.display()))?;
+
+    // Flush OS write cache to disk before closing — guards against data loss if
+    // the process crashes or power is lost between close and rename.
+    file.sync_all()
+        .map_err(|e| format!("failed to flush {}: {e}", tmp.display()))?;
+
+    // Explicitly drop the file handle before rename — Windows will not rename
+    // a file with an open handle.
+    drop(file);
+
+    fs::rename(&tmp, target)
+        .map_err(|e| format!("failed to move download to {}: {e}", target.display()))
 }
 
 #[cfg(windows)]
