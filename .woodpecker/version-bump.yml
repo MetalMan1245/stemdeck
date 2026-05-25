@@ -1,9 +1,9 @@
-# Triggered on every tag push. Updates all 5 version files to match the tag
+# Triggered on release publish. Updates all 5 version files to match the tag
 # and commits the result back to main so self-hosted users get the correct
 # version after a plain `git pull`.
 
 when:
-  - event: tag
+  - event: release
 
 labels:
   platform: linux/amd64

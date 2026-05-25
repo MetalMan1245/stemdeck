@@ -1,6 +1,5 @@
 when:
   - event: release
-  - event: tag
 
 labels:
   platform: windows/amd64
