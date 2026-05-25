@@ -161,10 +161,6 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("failed to build StemDeck desktop app")
         .run(|app_handle, event| match event {
-            tauri::RunEvent::ExitRequested { .. } => {
-                let state = app_handle.state::<BackendState>();
-                stop_backend(&state);
-            }
             tauri::RunEvent::WindowEvent {
                 event: tauri::WindowEvent::CloseRequested { .. },
                 ..
@@ -261,6 +257,7 @@ fn clear_webkit_data() {
     }
 }
 
+/// Returns current runtime state: Python path, FFmpeg path, and persisted torch device.
 #[tauri::command]
 fn probe_runtime() -> Result<RuntimeProbe, String> {
     let root = app_root()?;
@@ -289,6 +286,7 @@ fn read_config_str(data_dir: &std::path::Path, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(|s| s.to_string())
 }
 
+/// Returns the current state of the bundled Python runtime pack (manifest, archive, install).
 #[tauri::command]
 fn runtime_pack_status() -> Result<RuntimePackStatus, String> {
     let root = app_root()?;
@@ -320,6 +318,7 @@ fn runtime_pack_status() -> Result<RuntimePackStatus, String> {
     })
 }
 
+/// Downloads the Python runtime pack archive, emitting progress events to the frontend.
 #[tauri::command]
 async fn download_runtime_pack(app_handle: tauri::AppHandle) -> Result<RuntimeArchive, String> {
     ensure_workspace()?;
@@ -336,6 +335,7 @@ async fn download_runtime_pack(app_handle: tauri::AppHandle) -> Result<RuntimeAr
     verify_runtime_archive(&manifest, &archive)
 }
 
+/// Verifies the SHA256 of a previously downloaded runtime pack archive.
 #[tauri::command]
 fn verify_runtime_pack() -> Result<RuntimeArchive, String> {
     let root = app_root()?;
@@ -346,6 +346,7 @@ fn verify_runtime_pack() -> Result<RuntimeArchive, String> {
     verify_runtime_archive(&manifest, &archive)
 }
 
+/// Extracts the verified runtime pack archive and atomically swaps it into place.
 #[tauri::command]
 fn extract_runtime_pack() -> Result<RuntimePackStatus, String> {
     ensure_workspace()?;
@@ -409,6 +410,7 @@ fn extract_runtime_pack() -> Result<RuntimePackStatus, String> {
     runtime_pack_status()
 }
 
+/// Creates required data directories and runs any pending data migrations.
 #[tauri::command]
 fn ensure_workspace() -> Result<(), String> {
     let root = app_root()?;
@@ -434,6 +436,7 @@ fn ensure_workspace() -> Result<(), String> {
     Ok(())
 }
 
+/// Downloads FFmpeg/ffprobe if absent and writes their paths to config.json.
 #[tauri::command]
 fn ensure_external_assets() -> Result<AssetStatus, String> {
     ensure_workspace()?;
@@ -447,6 +450,7 @@ fn ensure_external_assets() -> Result<AssetStatus, String> {
     })
 }
 
+/// Spawns the Python/uvicorn backend, waits for it to become healthy, and returns its URL.
 #[tauri::command]
 fn start_backend(
     app_handle: tauri::AppHandle,
@@ -544,6 +548,7 @@ fn start_backend(
     Ok(BackendStarted { url })
 }
 
+/// Detects GPU hardware, installs CUDA torch if needed, and persists the chosen device.
 #[tauri::command]
 fn ensure_torch_device() -> Result<GpuSetup, String> {
     let root = app_root()?;
@@ -900,15 +905,9 @@ fn classify_cuda_install_error(stderr: &str) -> String {
             .to_string();
     }
 
-    // Unknown error — strip pip version-check noise, surface remaining stderr
-    let cleaned = stderr
-        .lines()
-        .filter(|l| {
-            !l.starts_with("WARNING: There was an error checking the latest version of pip")
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("CUDA torch install failed: {}", cleaned.trim())
+    // Unknown error — full stderr is already in setup.log; surface a generic message
+    // rather than leaking raw pip output (file paths, stack traces) to the UI.
+    "CUDA install failed — see logs/setup.log for details.".to_string()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -992,6 +991,7 @@ fn verify_cuda_torch(python: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Opens an http/https URL in the system browser. Rejects non-http schemes.
 #[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     if !url.starts_with("https://") && !url.starts_with("http://") {
@@ -1022,6 +1022,7 @@ fn open_url(url: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Prompts the user for a save path, then streams a localhost audio URL to disk.
 #[tauri::command]
 async fn save_audio_file(
     app: tauri::AppHandle,
@@ -1031,6 +1032,13 @@ async fn save_audio_file(
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("only http/https URLs are permitted".to_string());
     }
+    // Restrict to localhost to prevent SSRF from a compromised WebView (#138).
+    let parsed_url = reqwest::Url::parse(&url).map_err(|_| "invalid URL".to_string())?;
+    let host = parsed_url.host_str().unwrap_or("");
+    if host != "127.0.0.1" && host != "localhost" {
+        return Err("only localhost URLs are permitted".to_string());
+    }
+
     use tauri_plugin_dialog::DialogExt;
     let dest = app
         .dialog()
@@ -1041,8 +1049,14 @@ async fn save_audio_file(
         return Ok(()); // user cancelled
     };
     let dest = file_path.into_path().map_err(|e| e.to_string())?;
-    let client = reqwest::Client::new();
-    let resp = client
+
+    // Stream response to disk to avoid buffering a large audio file in memory (#139).
+    // 5-minute timeout covers large WAV exports over a slow loopback.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("failed to build client: {e}"))?;
+    let mut resp = client
         .get(&url)
         .send()
         .await
@@ -1050,11 +1064,20 @@ async fn save_audio_file(
     if !resp.status().is_success() {
         return Err(format!("backend returned HTTP {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
+    let tmp = dest.with_extension("audio.download");
+    let mut file =
+        std::fs::File::create(&tmp).map_err(|e| format!("failed to create temp file: {e}"))?;
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| format!("read failed: {e}"))?;
-    std::fs::write(&dest, &bytes).map_err(|e| format!("write failed: {e}"))?;
+        .map_err(|e| format!("read failed: {e}"))?
+    {
+        file.write_all(&chunk)
+            .map_err(|e| format!("write failed: {e}"))?;
+    }
+    file.sync_all().map_err(|e| format!("flush failed: {e}"))?;
+    drop(file);
+    std::fs::rename(&tmp, &dest).map_err(|e| format!("rename failed: {e}"))?;
     Ok(())
 }
 
@@ -1281,6 +1304,12 @@ async fn download_file_with_progress(
         },
     );
 
+    // Flush OS write cache before rename — guards against corrupt archive on
+    // Windows after power loss between close and rename.
+    file.sync_all()
+        .map_err(|e| format!("failed to flush {}: {e}", tmp.display()))?;
+    drop(file);
+
     fs::rename(&tmp, target)
         .map_err(|e| format!("failed to move runtime pack to {}: {e}", target.display()))
 }
@@ -1461,6 +1490,7 @@ fn backend_dir(root: &Path) -> Result<PathBuf, String> {
 }
 
 fn python_path(root: &Path) -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
     if let Ok(path) = env::var("STEMDECK_PYTHON") {
         return Some(PathBuf::from(path));
     }
@@ -1916,8 +1946,21 @@ fn update_setup_config<const N: usize>(
 
     let body = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("failed to serialize setup config: {e}"))?;
-    fs::write(&config_path, body + "\n")
-        .map_err(|e| format!("failed to write {}: {e}", config_path.display()))
+
+    // Write atomically: temp file → sync → rename. A crash mid-write leaves the
+    // previous config intact rather than producing a truncated/empty file.
+    let tmp_path = config_path.with_extension("json.tmp");
+    let mut tmp_file = fs::File::create(&tmp_path)
+        .map_err(|e| format!("failed to create {}: {e}", tmp_path.display()))?;
+    tmp_file
+        .write_all((body + "\n").as_bytes())
+        .map_err(|e| format!("failed to write {}: {e}", tmp_path.display()))?;
+    tmp_file
+        .sync_all()
+        .map_err(|e| format!("failed to flush {}: {e}", tmp_path.display()))?;
+    drop(tmp_file);
+    fs::rename(&tmp_path, &config_path)
+        .map_err(|e| format!("failed to move config to {}: {e}", config_path.display()))
 }
 
 fn command_output_with_timeout(
