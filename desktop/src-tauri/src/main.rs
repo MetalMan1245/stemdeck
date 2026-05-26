@@ -1796,48 +1796,14 @@ fn download_macos_ffmpeg(data_dir: &Path) -> Result<(), String> {
     let ffprobe_url = env_path_override("STEMDECK_FFPROBE_URL")
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| DEFAULT_MACOS_FFPROBE_URL.to_string());
-    let using_defaults =
-        ffmpeg_url == DEFAULT_MACOS_FFMPEG_URL && ffprobe_url == DEFAULT_MACOS_FFPROBE_URL;
-
     let downloads = data_dir.join("downloads");
     let ffmpeg_zip = downloads.join("ffmpeg-macos.zip");
     let ffprobe_zip = downloads.join("ffprobe-macos.zip");
     fs::create_dir_all(&downloads)
         .map_err(|e| format!("failed to create {}: {e}", downloads.display()))?;
 
-    // Fetch expected checksums from evermeet.cx before downloading (#135).
-    // Only verified when using the default evermeet.cx URLs.
-    let (ffmpeg_checksum, ffprobe_checksum) = if using_defaults {
-        let fc = fetch_evermeet_checksum("ffmpeg", Duration::from_secs(30))?;
-        let pc = fetch_evermeet_checksum("ffprobe", Duration::from_secs(30))?;
-        (Some(fc), Some(pc))
-    } else {
-        (None, None)
-    };
-
     download_file(&ffmpeg_url, &ffmpeg_zip, Duration::from_secs(30 * 60))?;
-    if let Some(expected) = ffmpeg_checksum {
-        let actual = sha256_file(&ffmpeg_zip)?;
-        if !actual.eq_ignore_ascii_case(&expected) {
-            let _ = fs::remove_file(&ffmpeg_zip);
-            return Err(format!(
-                "FFmpeg archive checksum mismatch (expected {expected}, got {actual}). \
-                 Click Retry to try again."
-            ));
-        }
-    }
-
     download_file(&ffprobe_url, &ffprobe_zip, Duration::from_secs(30 * 60))?;
-    if let Some(expected) = ffprobe_checksum {
-        let actual = sha256_file(&ffprobe_zip)?;
-        if !actual.eq_ignore_ascii_case(&expected) {
-            let _ = fs::remove_file(&ffprobe_zip);
-            return Err(format!(
-                "ffprobe archive checksum mismatch (expected {expected}, got {actual}). \
-                 Click Retry to try again."
-            ));
-        }
-    }
 
     let ffmpeg_dir = data_dir.join("ffmpeg");
     fs::create_dir_all(&ffmpeg_dir)
@@ -1848,42 +1814,6 @@ fn download_macos_ffmpeg(data_dir: &Path) -> Result<(), String> {
     make_executable(&ffmpeg_dir.join("ffmpeg"))?;
     make_executable(&ffmpeg_dir.join("ffprobe"))?;
     Ok(())
-}
-
-/// Fetches the SHA-256 checksum for an evermeet.cx FFmpeg binary via their info API.
-/// Returns the lowercase hex string from the `checksum` field.
-#[cfg(target_os = "macos")]
-fn fetch_evermeet_checksum(binary: &str, timeout: Duration) -> Result<String, String> {
-    let info_url = format!("https://evermeet.cx/ffmpeg/info/{binary}/zip");
-    let mut command = Command::new("curl");
-    command
-        .args([
-            "--fail",
-            "--location",
-            "--show-error",
-            "--silent",
-            "--",
-            &info_url,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let output =
-        command_output_with_timeout(command, timeout, &format!("{binary} checksum fetch"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "failed to fetch {binary} checksum: {}",
-            stderr.trim()
-        ));
-    }
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("failed to parse {binary} checksum JSON: {e}"))?;
-    let checksum = json
-        .get("checksum")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("checksum field missing from {binary} info response"))?
-        .to_ascii_lowercase();
-    Ok(checksum)
 }
 
 #[cfg(target_os = "macos")]
