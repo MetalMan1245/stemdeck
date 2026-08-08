@@ -299,6 +299,28 @@ async def get_stem_peaks(job_id: str) -> Response:
     )
 
 
+@router.get("/jobs/{job_id}/stems/beats.json")
+async def get_beat_grid(job_id: str) -> Response:
+    """Return the pre-computed beat grid driving the click track.
+
+    404s for jobs separated before this stage existed; the UI treats that as
+    "no click track available" rather than an error.
+    """
+    if not JOB_ID_RE.match(job_id):
+        raise HTTPException(status_code=404, detail="job not found")
+    job = registry_get(job_id)
+    if job is None or job.status != "done":
+        raise HTTPException(status_code=404, detail="job not ready")
+    path = (JOBS_DIR / job_id / "stems" / "beats.json").resolve()
+    if not path.is_file() or not path.is_relative_to(JOBS_DIR.resolve()):
+        raise HTTPException(status_code=404, detail="beat grid not found")
+    return FileResponse(
+        path,
+        media_type="application/json",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
 @router.api_route("/jobs/{job_id}/stems/{name}.wav", methods=["GET", "HEAD"], response_model=None)
 async def get_stem(
     job_id: str,
