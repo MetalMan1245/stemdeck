@@ -3,18 +3,21 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import functools
+import io
 import logging
 import os
 import re
 import signal
 import socket
+import time
+import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.api.router import router
@@ -22,6 +25,7 @@ from app.core.config import (
     DEMUCS_MODEL,
     FFMPEG_BIN,
     JOBS_DIR,
+    LOGS_DIR,
     STATIC_DIR,
     available_torch_devices,
     configure_portable_environment,
@@ -363,6 +367,98 @@ def get_registry_raw() -> PlainTextResponse:
             '{\n  "version": 1,\n  "jobs": []\n}\n', media_type="application/json"
         )
     return PlainTextResponse(path.read_text(encoding="utf-8"), media_type="application/json")
+
+
+# Every log this deployment can produce, with what writes each one. The desktop
+# entries only exist under the Tauri shell -- the Docker/server deployments have
+# just the Python log -- so the endpoint reports which are actually present
+# rather than promising files that will never appear.
+_LOG_FILES: tuple[tuple[str, str], ...] = (
+    (
+        "stemdeck.log",
+        "Application log: the pipeline, API and job activity. Rotates at 5 MB, 3 kept.",
+    ),
+    ("stemdeck.log.1", "Older application log."),
+    ("stemdeck.log.2", "Older application log."),
+    ("stemdeck.log.3", "Oldest kept application log."),
+    ("backend.log", "Desktop only: raw output of the bundled Python backend process."),
+    ("backend.log.1", "Desktop only: older backend output."),
+    ("backend.log.2", "Desktop only: oldest kept backend output."),
+    ("setup.log", "Desktop only: first-run setup and GPU runtime installation."),
+)
+
+
+@app.get("/api/logs", tags=["settings"])
+def get_logs_info() -> dict[str, object]:
+    """Where the log files live and which currently exist (Settings -> Logs).
+
+    Read-only and metadata only: it reports paths and sizes, never contents.
+    Serving log text over HTTP would expose whatever a traceback happened to
+    capture, and the files are on the machine the user is already sitting at.
+    """
+    logs_dir = LOGS_DIR.resolve()
+    files: list[dict[str, object]] = []
+    for name, description in _LOG_FILES:
+        path = logs_dir / name
+        try:
+            stat = path.stat()
+            exists, size, modified = True, stat.st_size, stat.st_mtime
+        except OSError:
+            exists, size, modified = False, 0, None
+        files.append(
+            {
+                "name": name,
+                "description": description,
+                "path": str(path),
+                "exists": exists,
+                "size": size,
+                "modified": modified,
+            }
+        )
+    return {
+        "dir": str(logs_dir),
+        "dir_exists": logs_dir.is_dir(),
+        "files": files,
+    }
+
+
+@app.get("/api/logs.zip", tags=["settings"])
+def download_logs_zip() -> StreamingResponse:
+    """Bundle the log files into a zip for support and bug reports.
+
+    Only the known log names are read, never whatever else happens to be in the
+    directory: the set is fixed above, so a stray file dropped in LOGS_DIR can
+    never be swept into a download. Built in memory -- these are capped at 5 MB
+    x 3 backups plus two small desktop logs, so the whole set is bounded.
+    """
+    logs_dir = LOGS_DIR.resolve()
+    buf = io.BytesIO()
+    written = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, _description in _LOG_FILES:
+            path = logs_dir / name
+            try:
+                if not path.is_file():
+                    continue
+                zf.writestr(name, path.read_bytes())
+                written += 1
+            except OSError:
+                _log.warning("could not add %s to the log bundle", name, exc_info=True)
+        if written == 0:
+            # An empty zip is a confusing download; say so inside it instead.
+            zf.writestr(
+                "README.txt",
+                f"No log files were found in {logs_dir}.\n"
+                "Logging starts on the first message after the app launches.\n",
+            )
+
+    buf.seek(0)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="stemdeck-logs-{stamp}.zip"'},
+    )
 
 
 # Content-Security-Policy. Defense-in-depth so an injected string in the webview

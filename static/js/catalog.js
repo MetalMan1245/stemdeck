@@ -2284,6 +2284,79 @@ async function loadRegistryView(overlay) {
   }
 }
 
+function _fmtBytes(n) {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${u[i]}`;
+}
+
+/** Read-only listing of the log files: paths, sizes and what writes each one.
+ *  Contents are deliberately not served -- a traceback can capture anything,
+ *  and the files are on the machine the user is already sitting at. */
+async function loadLogsView(overlay) {
+  const pathEl = overlay.querySelector(".settings-logs-path");
+  const listEl = overlay.querySelector(".settings-logs-list");
+  if (!pathEl || !listEl) return;
+  listEl.textContent = "Loading…";
+  try {
+    const r = await fetch("/api/logs", { cache: "no-store" });
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    const info = await r.json();
+    pathEl.textContent = info.dir;
+    const present = (info.files || []).filter((f) => f.exists);
+    if (!present.length) {
+      listEl.innerHTML = `<div class="settings-logs-empty">No log files yet${
+        info.dir_exists ? "" : " (the folder has not been created)"
+      }. Logging starts on the first message after launch.</div>`;
+      return;
+    }
+    listEl.innerHTML = present
+      .map((f) => {
+        const when = f.modified
+          ? new Date(f.modified * 1000).toLocaleString()
+          : "";
+        return `<div class="settings-log-row">
+            <div class="settings-log-main">
+              <code class="settings-log-name">${f.name}</code>
+              <span class="settings-log-meta">${_fmtBytes(f.size)}${when ? ` · ${when}` : ""}</span>
+            </div>
+            <div class="settings-log-desc">${f.description}</div>
+          </div>`;
+      })
+      .join("");
+  } catch (e) {
+    console.warn("[settings] failed to load log info:", e);
+    pathEl.textContent = "unavailable";
+    listEl.textContent = "Failed to load log information.";
+  }
+}
+
+/** Download every log file as one zip, for attaching to a bug report. */
+async function exportLogs(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = "Preparing…"; }
+  try {
+    const r = await fetch("/api/logs.zip", { cache: "no-store" });
+    if (!r.ok) throw new Error(`status ${r.status}`);
+    const blob = await r.blob();
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `stemdeck-logs-${stamp}.zip`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.warn("[settings] log export failed:", e);
+    showError("Could not export the logs.");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Export logs"; }
+  }
+}
+
 let resetConfirmOverlay = null;
 
 function closeResetConfirm() {
@@ -2380,6 +2453,7 @@ function openLibraryEditor() {
         <button class="settings-tab active" type="button" data-tab="general" role="tab">General</button>
         <button class="settings-tab" type="button" data-tab="network" role="tab">Network</button>
         <button class="settings-tab" type="button" data-tab="export" role="tab">Export</button>
+        <button class="settings-tab" type="button" data-tab="logs" role="tab">Logs</button>
         <button class="settings-tab" type="button" data-tab="registry" role="tab">Registry</button>
       </div>
       <div class="settings-pane" data-pane="general">
@@ -2428,6 +2502,15 @@ function openLibraryEditor() {
         <div class="library-editor-foot">
           <span class="library-editor-status" aria-live="polite"></span>
           <button class="library-editor-sync" type="button">Resync out of sync tracks</button>
+        </div>
+        <div class="settings-section">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">Export logs</div>
+              <div class="settings-row-desc">Download every log file as a single zip — the thing to attach to a bug report. See the Logs tab for where they live.</div>
+            </div>
+            <button class="settings-export-logs" type="button">Export logs</button>
+          </div>
         </div>
         <div class="settings-section settings-danger-zone">
           <div class="settings-subhead settings-danger-subhead">Danger zone</div>
@@ -2482,6 +2565,17 @@ function openLibraryEditor() {
           </div>
         </div>
       </div>
+      <div class="settings-pane hidden" data-pane="logs">
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <div class="settings-row-title">Log location</div>
+            <div class="settings-row-desc">Where StemDeck writes its logs on this machine. Read-only — open them in a file manager or use Export logs.</div>
+          </div>
+          <button class="settings-registry-refresh settings-logs-refresh" type="button">Refresh</button>
+        </div>
+        <div class="settings-logs-dir"><code class="settings-logs-path">Loading…</code></div>
+        <div class="settings-logs-list">Loading…</div>
+      </div>
       <div class="settings-pane hidden" data-pane="registry">
         <div class="settings-row">
           <div class="settings-row-text">
@@ -2506,9 +2600,13 @@ function openLibraryEditor() {
       overlay.querySelectorAll(".settings-tab").forEach((t) => t.classList.toggle("active", t === tab));
       overlay.querySelectorAll(".settings-pane").forEach((p) => p.classList.toggle("hidden", p.dataset.pane !== name));
       if (name === "registry") loadRegistryView(overlay);
+      if (name === "logs") loadLogsView(overlay);
     });
   });
-  overlay.querySelector(".settings-registry-refresh")?.addEventListener("click", () => loadRegistryView(overlay));
+  overlay.querySelector(".settings-registry-refresh:not(.settings-logs-refresh)")
+    ?.addEventListener("click", () => loadRegistryView(overlay));
+  overlay.querySelector(".settings-logs-refresh")?.addEventListener("click", () => loadLogsView(overlay));
+  overlay.querySelector(".settings-export-logs")?.addEventListener("click", (e) => exportLogs(e.currentTarget));
 
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeLibraryEditor(); });
   // (status summary is filled in after the overlay is in the DOM, below)
