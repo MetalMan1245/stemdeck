@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import time
 import zipfile
 
 import pytest
@@ -133,3 +134,118 @@ def test_zip_skips_an_unreadable_file_rather_than_failing(client, logs_dir, monk
 
     monkeypatch.setattr(type(logs_dir), "read_bytes", _boom)
     assert _names(client.get("/api/logs.zip")) == {"stemdeck.log"}
+
+
+# --- GET /api/logs/{view} --------------------------------------------------
+
+
+def _stamp(offset_min: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - offset_min * 60))
+
+
+def test_tail_keeps_only_the_requested_window(client, logs_dir):
+    (logs_dir / "stemdeck.log").write_text(
+        f"{_stamp(180)} I stemdeck ancient\n"
+        f"{_stamp(90)} I stemdeck too old\n"
+        f"{_stamp(10)} I stemdeck recent\n",
+        encoding="utf-8",
+    )
+    body = client.get("/api/logs/application?minutes=60").text
+    assert "recent" in body
+    assert "too old" not in body
+    assert "ancient" not in body
+
+
+def test_tail_keeps_untimestamped_continuation_lines(client, logs_dir):
+    """A traceback is one event across many lines; dropping the ones without a
+    timestamp of their own would shred it."""
+    (logs_dir / "stemdeck.log").write_text(
+        f"{_stamp(5)} E stemdeck job failed\n"
+        "Traceback (most recent call last):\n"
+        '  File "x.py", line 1\n'
+        "ValueError: boom\n",
+        encoding="utf-8",
+    )
+    body = client.get("/api/logs/application?minutes=60").text
+    assert "Traceback (most recent call last):" in body
+    assert "ValueError: boom" in body
+
+
+def test_tail_drops_continuations_of_old_entries(client, logs_dir):
+    (logs_dir / "stemdeck.log").write_text(
+        f"{_stamp(200)} E stemdeck old failure\n"
+        "  old traceback line\n"
+        f"{_stamp(2)} I stemdeck fresh\n",
+        encoding="utf-8",
+    )
+    body = client.get("/api/logs/application?minutes=60").text
+    assert "old traceback line" not in body
+    assert "fresh" in body
+
+
+def test_tail_reads_the_previous_rotation_too(client, logs_dir):
+    """A rotation inside the window would otherwise make a busy log look empty."""
+    (logs_dir / "stemdeck.log.1").write_text(f"{_stamp(20)} I stemdeck before rotation\n", "utf-8")
+    (logs_dir / "stemdeck.log").write_text(f"{_stamp(5)} I stemdeck after rotation\n", "utf-8")
+    body = client.get("/api/logs/application?minutes=60").text
+    assert "before rotation" in body
+    assert body.index("before rotation") < body.index("after rotation"), (
+        "must read forwards in time"
+    )
+
+
+def test_tail_parses_the_setup_log_epoch_format(client, logs_dir):
+    """setup.log is written by the Tauri shell with epoch seconds, because the
+    crate has no date library."""
+    now = int(time.time())
+    (logs_dir / "setup.log").write_text(
+        f"[{now - 7200}] [stemdeck] old entry\n[{now - 60}] [stemdeck] new entry\n",
+        encoding="utf-8",
+    )
+    body = client.get("/api/logs/setup?minutes=60").text
+    assert "new entry" in body
+    assert "old entry" not in body
+
+
+def test_tail_says_so_when_the_window_is_empty(client, logs_dir):
+    (logs_dir / "stemdeck.log").write_text(f"{_stamp(500)} I stemdeck ancient\n", encoding="utf-8")
+    assert "No entries in the last 60 minutes" in client.get("/api/logs/application").text
+
+
+def test_tail_says_so_when_the_file_is_missing(client, logs_dir):
+    assert "No log file yet" in client.get("/api/logs/setup").text
+
+
+def test_tail_rejects_an_unknown_view(client, logs_dir):
+    assert client.get("/api/logs/nope").status_code == 404
+
+
+@pytest.mark.parametrize(
+    "view",
+    [
+        "..%2F..%2Fetc%2Fpasswd",
+        "%2e%2e%2fsettings",
+        "stemdeck.log",  # a real filename is still not a view name
+        "logs.zip",
+    ],
+)
+def test_tail_only_serves_named_views_not_paths(client, logs_dir, view):
+    """The view name maps to a fixed file set rather than being joined onto a
+    path, so nothing outside that set is reachable. (A literal "../x" is
+    normalised away by the client before it reaches the route, so the encoded
+    forms are the ones worth asserting.)"""
+    assert client.get(f"/api/logs/{view}").status_code == 404
+
+
+def test_tail_clamps_an_absurd_window(client, logs_dir):
+    (logs_dir / "stemdeck.log").write_text(f"{_stamp(1)} I stemdeck hi\n", encoding="utf-8")
+    assert client.get("/api/logs/application?minutes=999999").status_code == 200
+
+
+def test_tail_truncates_a_flood(client, logs_dir):
+    (logs_dir / "stemdeck.log").write_text(
+        "".join(f"{_stamp(1)} I stemdeck line {i}\n" for i in range(6000)), encoding="utf-8"
+    )
+    body = client.get("/api/logs/application").text
+    assert "earlier lines not shown" in body
+    assert len(body.splitlines()) < 4200

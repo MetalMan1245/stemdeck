@@ -2809,3 +2809,29 @@ input, textarea { font-family: inherit; }
 }
 .settings-export-logs:hover:not(:disabled) { background: var(--panel-3); color: var(--fg); }
 .settings-export-logs:disabled { opacity: 0.5; cursor: default; }
+
+/* Logs sub-navigation: Location / Application / Setup. */
+.settings-subtabs {
+  display: flex; gap: 2px; margin: 0 0 10px;
+  border-bottom: 1px solid var(--border-strong);
+}
+.settings-subtab {
+  padding: 5px 10px; background: none; border: none;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+  color: var(--muted); cursor: pointer;
+  font-family: inherit; font-size: 11.5px; font-weight: 600;
+  transition: color var(--t-fast), border-color var(--t-fast);
+}
+.settings-subtab:hover { color: var(--fg-2); }
+.settings-subtab.active { color: var(--accent); border-bottom-color: var(--accent); }
+/* The pane is a flex column and the registry/log textareas rely on flex:1 to
+   fill it, so the subpane has to be one too -- otherwise the textarea collapses
+   to its default character width and the lines get cut off. */
+.settings-subpane { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.settings-subpane.hidden { display: none; }
+/* The tail views are monospace and taller than the registry dump: log lines
+   are long and wrap badly. */
+.settings-logtail-view {
+  width: 100%; box-sizing: border-box;
+  min-height: 260px; white-space: pre; overflow-wrap: normal; overflow-x: auto;
+}

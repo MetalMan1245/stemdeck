@@ -15,6 +15,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
@@ -420,6 +421,105 @@ def get_logs_info() -> dict[str, object]:
         "dir_exists": logs_dir.is_dir(),
         "files": files,
     }
+
+
+# Views the Logs tab offers, each mapping to the newest file of a family plus
+# the backup immediately before it -- a rotation inside the window would
+# otherwise make a busy log look empty.
+_LOG_VIEWS: dict[str, tuple[str, ...]] = {
+    "application": ("stemdeck.log", "stemdeck.log.1"),
+    "setup": ("setup.log",),
+}
+# Bounds on what a single view returns. The application log rotates at 5 MB, so
+# an unbounded "last hour" on a busy server could still be enormous.
+_LOG_TAIL_BYTES = 1_500_000
+_LOG_TAIL_LINES = 4000
+
+# "2026-07-18 12:43:42 I stemdeck ..." -- the file handler's datefmt.
+_PY_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ")
+# "[1786205373] [stemdeck] ..." -- setup.log, epoch seconds (see the Rust
+# writer; the crate has no date library).
+_SETUP_LOG_TS = re.compile(r"^\[(\d{9,})\] ")
+
+
+def _line_time(line: str) -> float | None:
+    """Epoch seconds for a log line, or None when it carries no timestamp."""
+    m = _PY_LOG_TS.match(line)
+    if m:
+        try:
+            return time.mktime(time.strptime(m.group(1), "%Y-%m-%d %H:%M:%S"))
+        except ValueError:
+            return None
+    m = _SETUP_LOG_TS.match(line)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _tail_lines(path: Path) -> list[str]:
+    """Last _LOG_TAIL_BYTES of a file as lines, without reading all of it."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > _LOG_TAIL_BYTES:
+                f.seek(size - _LOG_TAIL_BYTES)
+                f.readline()  # discard the partial first line
+            raw = f.read()
+    except OSError:
+        return []
+    return raw.decode("utf-8", errors="replace").splitlines()
+
+
+@app.get("/api/logs/{view}", tags=["settings"])
+def get_log_tail(view: str, minutes: int = 60) -> PlainTextResponse:
+    """Recent lines from a log, for the Settings -> Logs viewer.
+
+    Lines older than `minutes` are dropped. Lines with no timestamp of their own
+    (tracebacks, subprocess output) belong to the line above them, so they
+    inherit its time rather than being shredded out of a multi-line error.
+    """
+    files = _LOG_VIEWS.get(view)
+    if files is None:
+        raise HTTPException(status_code=404, detail="unknown log")
+    window = max(1, min(minutes, 24 * 60))
+    cutoff = time.time() - window * 60
+
+    logs_dir = LOGS_DIR.resolve()
+    lines: list[str] = []
+    # Oldest backup first so the result reads forwards in time.
+    for name in reversed(files):
+        path = logs_dir / name
+        if path.is_file():
+            lines.extend(_tail_lines(path))
+
+    kept: list[str] = []
+    including = False
+    for line in lines:
+        ts = _line_time(line)
+        if ts is None:
+            # Continuation of whatever came before it.
+            if including:
+                kept.append(line)
+            continue
+        including = ts >= cutoff
+        if including:
+            kept.append(line)
+
+    if not kept:
+        body = (
+            f"No entries in the last {window} minutes.\n"
+            if lines
+            else f"No log file yet at {logs_dir / files[0]}.\n"
+        )
+        return PlainTextResponse(body, media_type="text/plain; charset=utf-8")
+
+    truncated = ""
+    if len(kept) > _LOG_TAIL_LINES:
+        truncated = f"[... {len(kept) - _LOG_TAIL_LINES} earlier lines not shown ...]\n"
+        kept = kept[-_LOG_TAIL_LINES:]
+    return PlainTextResponse(
+        truncated + "\n".join(kept) + "\n", media_type="text/plain; charset=utf-8"
+    )
 
 
 @app.get("/api/logs.zip", tags=["settings"])

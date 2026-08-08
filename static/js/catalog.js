@@ -2333,6 +2333,23 @@ async function loadLogsView(overlay) {
   }
 }
 
+/** Recent lines from one log, read-only. The window is applied server-side so
+ *  a large file is never shipped in full. */
+async function loadLogTail(overlay, view) {
+  const el = overlay.querySelector(`.settings-logtail-view[data-view="${view}"]`);
+  if (!el) return;
+  el.value = "Loading…";
+  try {
+    const r = await fetch(`/api/logs/${view}?minutes=60`, { cache: "no-store" });
+    el.value = r.ok ? await r.text() : `Failed to load the log (status ${r.status}).`;
+  } catch (e) {
+    console.warn("[settings] failed to load log tail:", e);
+    el.value = "Failed to load the log — check your connection.";
+  }
+  // Newest entries are the interesting ones.
+  el.scrollTop = el.scrollHeight;
+}
+
 /** Download every log file as one zip, for attaching to a bug report. */
 async function exportLogs(btn) {
   if (btn) { btn.disabled = true; btn.textContent = "Preparing…"; }
@@ -2566,15 +2583,42 @@ function openLibraryEditor() {
         </div>
       </div>
       <div class="settings-pane hidden" data-pane="logs">
-        <div class="settings-row">
-          <div class="settings-row-text">
-            <div class="settings-row-title">Log location</div>
-            <div class="settings-row-desc">Where StemDeck writes its logs on this machine. Read-only — open them in a file manager or use Export logs.</div>
-          </div>
-          <button class="settings-registry-refresh settings-logs-refresh" type="button">Refresh</button>
+        <div class="settings-subtabs" role="tablist">
+          <button class="settings-subtab active" type="button" data-sub="location" role="tab">Location</button>
+          <button class="settings-subtab" type="button" data-sub="application" role="tab">Application log</button>
+          <button class="settings-subtab" type="button" data-sub="setup" role="tab">Setup log</button>
         </div>
-        <div class="settings-logs-dir"><code class="settings-logs-path">Loading…</code></div>
-        <div class="settings-logs-list">Loading…</div>
+        <div class="settings-subpane" data-subpane="location">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">Log location</div>
+              <div class="settings-row-desc">Where StemDeck writes its logs on this machine. Read-only — open them in a file manager or use Export logs.</div>
+            </div>
+            <button class="settings-registry-refresh settings-logs-refresh" type="button">Refresh</button>
+          </div>
+          <div class="settings-logs-dir"><code class="settings-logs-path">Loading…</code></div>
+          <div class="settings-logs-list">Loading…</div>
+        </div>
+        <div class="settings-subpane hidden" data-subpane="application">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">Application log</div>
+              <div class="settings-row-desc">The last hour from <code>stemdeck.log</code> — pipeline, API and job activity. Read-only.</div>
+            </div>
+            <button class="settings-registry-refresh settings-logtail-refresh" type="button" data-view="application">Refresh</button>
+          </div>
+          <textarea class="settings-registry-view settings-logtail-view" data-view="application" readonly spellcheck="false" aria-label="Application log (read only)">Loading…</textarea>
+        </div>
+        <div class="settings-subpane hidden" data-subpane="setup">
+          <div class="settings-row">
+            <div class="settings-row-text">
+              <div class="settings-row-title">Setup log</div>
+              <div class="settings-row-desc">The last hour from <code>setup.log</code> — first-run setup and GPU runtime installation. Desktop app only. Read-only.</div>
+            </div>
+            <button class="settings-registry-refresh settings-logtail-refresh" type="button" data-view="setup">Refresh</button>
+          </div>
+          <textarea class="settings-registry-view settings-logtail-view" data-view="setup" readonly spellcheck="false" aria-label="Setup log (read only)">Loading…</textarea>
+        </div>
       </div>
       <div class="settings-pane hidden" data-pane="registry">
         <div class="settings-row">
@@ -2606,6 +2650,17 @@ function openLibraryEditor() {
   overlay.querySelector(".settings-registry-refresh:not(.settings-logs-refresh)")
     ?.addEventListener("click", () => loadRegistryView(overlay));
   overlay.querySelector(".settings-logs-refresh")?.addEventListener("click", () => loadLogsView(overlay));
+  overlay.querySelectorAll(".settings-subtab").forEach((tab) => {
+    tab.addEventListener("click", () => {
+      const name = tab.dataset.sub;
+      overlay.querySelectorAll(".settings-subtab").forEach((t) => t.classList.toggle("active", t === tab));
+      overlay.querySelectorAll(".settings-subpane").forEach((p) => p.classList.toggle("hidden", p.dataset.subpane !== name));
+      if (name === "location") loadLogsView(overlay);
+      else loadLogTail(overlay, name);
+    });
+  });
+  overlay.querySelectorAll(".settings-logtail-refresh").forEach((b) =>
+    b.addEventListener("click", () => loadLogTail(overlay, b.dataset.view)));
   overlay.querySelector(".settings-export-logs")?.addEventListener("click", (e) => exportLogs(e.currentTarget));
 
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeLibraryEditor(); });
