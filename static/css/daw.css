@@ -2039,15 +2039,13 @@ input, textarea { font-family: inherit; }
   justify-self: center;
 }
 .footer-transport .footer-loop-times { justify-self: end; min-width: 0; }
-.footer-transport .daw-iconbtn.btn-transport,
-.footer-experimental .daw-iconbtn.btn-transport {
+.footer-transport .daw-iconbtn.btn-transport {
   background: var(--panel-2);
   border-color: var(--border-strong);
   color: var(--fg-2);
   transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
-.footer-transport .daw-iconbtn.btn-transport:hover,
-.footer-experimental .daw-iconbtn.btn-transport:hover {
+.footer-transport .daw-iconbtn.btn-transport:hover {
   background: var(--panel-3);
   color: var(--fg);
 }
@@ -2065,25 +2063,36 @@ input, textarea { font-family: inherit; }
   color: #4a8cff;
 }
 
-/* Experimental features box, right-hand side of the footer. Visually set apart
-   so it reads as "not part of the normal transport". */
+/* Experimental features pill, centred above the transport. Deliberately set
+   apart from the transport buttons so it does not read as core playback. */
 .footer-experimental {
-  display: flex; align-items: center; gap: 8px;
-  padding: 5px 10px 5px 9px;
-  border: 1px dashed var(--border-strong);
+  position: relative;
+  display: flex; justify-content: center;
+  margin-bottom: 2px;
+}
+.exp-pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 5px 12px 5px 10px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-strong);
   border-radius: 8px;
-  background: color-mix(in srgb, var(--panel-2) 55%, transparent);
-  flex-shrink: 0;
-}
-.exp-label {
-  font-size: 9.5px; font-weight: 700; letter-spacing: 0.09em;
-  text-transform: uppercase; color: var(--muted);
+  color: var(--fg-2); cursor: pointer;
+  font-family: inherit; font-size: 10.5px; font-weight: 700;
+  letter-spacing: 0.09em; text-transform: uppercase;
   white-space: nowrap; user-select: none;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
-/* The panel is anchored right here: centred on the button it would run off the
-   edge of the window in this position. */
-.footer-experimental .footer-metro-panel {
-  left: auto; right: -8px; transform: none;
+.exp-pill:hover:not(:disabled) { background: var(--panel-3); color: var(--fg); }
+.exp-pill:disabled { opacity: 0.4; cursor: not-allowed; }
+.exp-flask { flex-shrink: 0; color: #4a8cff; }
+.exp-pill:disabled .exp-flask { color: currentColor; }
+/* Lit while the click is running, so its state is visible without opening
+   the panel. */
+.exp-pill.active,
+.exp-pill.active:hover {
+  background: rgba(74,140,255,0.16);
+  border-color: rgba(74,140,255,0.55);
+  color: #4a8cff;
 }
 
 /* Beat grid editor: canvas overlay + toolbar */
@@ -2136,15 +2145,6 @@ input, textarea { font-family: inherit; }
 
 /* Click track: toggle button + its options popover */
 .footer-metro-wrap { position: relative; display: flex; align-items: center; }
-.btn-transport.metro.active,
-.btn-transport.metro.active:hover {
-  background: rgba(74,140,255,0.16);
-  border-color: rgba(74,140,255,0.55);
-  color: #4a8cff;
-}
-.btn-transport.metro:disabled {
-  opacity: 0.4; cursor: not-allowed;
-}
 .footer-metro-panel {
   position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
   z-index: 60; min-width: 210px;
