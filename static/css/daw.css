@@ -2331,6 +2331,20 @@ input, textarea { font-family: inherit; }
 
 /* MP4 is offered as an export format only when the job has a preserved video
    track (mp4 upload or YouTube). player.js toggles .has-video on the wrap. */
+/* Opt-in rather than automatic: baking a permanent click into a bounce you
+   meant to be clean is not obvious until you play it back. Applies to every
+   format, audio and video alike. */
+.export-click-opt {
+  display: flex; align-items: center; gap: 7px;
+  margin: 2px 4px 4px; padding: 5px 6px;
+  border-radius: 6px; cursor: pointer; user-select: none;
+  font-size: 11.5px; font-weight: 600; color: var(--fg-2);
+}
+.export-click-opt:hover { background: var(--panel-3); color: var(--fg); }
+.export-click-opt input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+.export-click-opt.disabled { opacity: 0.4; cursor: not-allowed; }
+.export-click-opt.disabled:hover { background: none; color: var(--fg-2); }
+
 .export-fmt-video { display: none; }
 #footer-export-wrap.has-video .export-fmt-video { display: block; flex: 1; }
 

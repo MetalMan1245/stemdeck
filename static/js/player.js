@@ -18,6 +18,7 @@ import {
   footerTitle, footerMeta, footerThumb,
   setFooterWaveDrawFn,
   metronome, setMetronome, metronomeEnabled, metronomeVolume, metronomeBeatsPerBar,
+  exportClickEl, exportClickWrap,
   setMetronomeHasBars,
 } from "./state.js";
 import { createAudioEngine, estimateDecodedBytes } from "./audioEngine.js";
@@ -724,6 +725,7 @@ export function destroyPlayer() {
   resetSpeed();
   teardownMetronome();
   updateMetronomeAvailability(null, "Load a track to use the click");
+  setExportClickAvailable(false);
   if (audioEngine) {
     audioEngine.destroy();
     setAudioEngine(null);
@@ -1281,6 +1283,7 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
             const beats = Array.isArray(grid?.beats) ? grid.beats : null;
             if (!beats?.length) {
               updateMetronomeAvailability(null, "No beat grid for this track");
+              setExportClickAvailable(false);
               return;
             }
             const m = createMetronome(eng, beats, {
@@ -1307,6 +1310,7 @@ export function wireUpAudio(jobId, stems, duration, thumbnail, mixUrl = null, ti
               },
             });
             setBeatGridAvailable(!!editable && !!m);
+            setExportClickAvailable(!!beats?.length);
             // One place decides how accents are driven; the panel's Accent
             // setting can override the detected bar marks.
             applyMetronomeAccent();
@@ -1557,6 +1561,26 @@ function _effectiveMixGains() {
   return { names, gains };
 }
 
+// Click-track export params. The click is synthesised in the browser during
+// playback, so the server can only reproduce it if it is told the rate and
+// accent mode the user was monitoring with. Opt-in: baking a permanent click
+// into an export meant to be clean is not obvious until playback.
+function _clickParams(q) {
+  if (!exportClickEl?.checked || exportClickEl.disabled) return;
+  q.set("click", "1");
+  q.set("click_mult", String(metronome?.getMultiplier?.() ?? 1));
+  q.set("click_accent", String(metronomeBeatsPerBar));
+  q.set("click_gain", metronomeVolume.toFixed(3));
+}
+
+/** Whether this track can export a click at all (needs a beat grid). */
+export function setExportClickAvailable(on) {
+  if (!exportClickEl) return;
+  exportClickEl.disabled = !on;
+  if (!on) exportClickEl.checked = false;
+  exportClickWrap?.classList.toggle("disabled", !on);
+}
+
 // Dynamic mixdown URL for the current mixer state. Returns null (no download)
 // when every lane is silenced; `region` appends the loop bounds.
 function _mixdownUrl(ext, region) {
@@ -1571,6 +1595,7 @@ function _mixdownUrl(ext, region) {
     q.set("start", loopStart.toFixed(3));
     q.set("end", loopEnd.toFixed(3));
   }
+  _clickParams(q);
   return `/api/jobs/${currentJobId}/mixdown.${ext}?${q}`;
 }
 
@@ -1604,6 +1629,7 @@ export function downloadCurrentVideo() {
     stems: names.join(","),
     gains: gains.map((g) => g.toFixed(3)).join(","),
   });
+  _clickParams(q);
   const safe = _currentTitle
     .replace(/[^a-zA-Z0-9]+/g, "_")
     .replace(/_{2,}/g, "_")

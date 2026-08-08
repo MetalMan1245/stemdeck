@@ -69,6 +69,18 @@ export function createMetronome(engine, beats, { volume = 0.6, beatsPerBar = 0 }
   // a fixed beats-per-bar count from the start of the track.
   let _isDownbeat = null;
 
+  // Map an index in the rescaled grid back to the original beat it came from.
+  // Bar marks are recorded against the *detected* beats, so accents have to be
+  // decided in that index space: at x2 the odd entries are inserted midpoints
+  // belonging to no original beat, and at /2 every entry is two apart. Without
+  // this the accent lands on the wrong beat whenever the rate is not 1x.
+  // Mirrored by source_index() in app/pipeline/click_render.py so exports agree.
+  function _sourceIndex(i) {
+    if (_multiplier === 2) return i % 2 === 0 ? i / 2 : null;
+    if (_multiplier === 0.5) return i * 2;
+    return i;
+  }
+
   function _rescale(mult) {
     if (mult === 2) {
       const out = [];
@@ -186,9 +198,10 @@ export function createMetronome(engine, beats, { volume = 0.6, beatsPerBar = 0 }
       if (when > ctx.currentTime) {
         // Bar marks from the editor win over the fixed beats-per-bar count:
         // on a track whose meter changes, a fixed count is meaningless.
+        const src = _sourceIndex(cursor);
         const accent = _isDownbeat
-          ? !!_isDownbeat(cursor)
-          : (_beatsPerBar > 0 && cursor % _beatsPerBar === 0);
+          ? src !== null && !!_isDownbeat(src)
+          : (_beatsPerBar > 0 && src !== null && src % _beatsPerBar === 0);
         _scheduleClick(when, accent);
       }
       cursor++;
