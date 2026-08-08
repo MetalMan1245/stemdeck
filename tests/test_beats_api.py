@@ -236,9 +236,14 @@ def test_delete_reverts_to_detected_grid(client, tmp_path, done_job):
 
 def test_delete_is_idempotent(client, tmp_path, done_job):
     _write_computed(tmp_path)
-    assert client.delete(f"/api/jobs/{JOB}/beats").status_code == 200
-    assert client.delete(f"/api/jobs/{JOB}/beats").status_code == 200
+    # The requests are made outside the assert: `python -O` strips asserts, and
+    # a call hidden inside one would silently stop happening.
+    first = client.delete(f"/api/jobs/{JOB}/beats")
+    second = client.delete(f"/api/jobs/{JOB}/beats")
+    assert first.status_code == 200
+    assert second.status_code == 200
 
 
 def test_delete_rejects_malformed_job_id(client):
-    assert client.delete("/api/jobs/ABC/beats").status_code == 404
+    resp = client.delete("/api/jobs/ABC/beats")
+    assert resp.status_code == 404

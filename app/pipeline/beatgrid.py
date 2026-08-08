@@ -703,7 +703,8 @@ def compute_beat_grid(stems_dir: Path) -> dict | None:
         # Coefficient of variation of the beat intervals: 0 is metronomic.
         # Surfaced so the UI can distinguish "steady song" from "the tracker
         # is wandering", which look identical from BPM alone.
-        cv = float(intervals.std() / median_interval) if median_interval > 0 else 0.0
+        # median_interval is guaranteed positive by the guard above.
+        cv = float(intervals.std() / median_interval)
 
         beats, head_added, tail_added = _extend_to_track_edges(beats, duration, irregularity)
         beats = _sanitize(beats, duration)

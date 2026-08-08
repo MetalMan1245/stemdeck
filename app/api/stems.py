@@ -222,7 +222,10 @@ def _read_beat_grid(job_id: str) -> dict | None:
                 grid["beats"] = edits["beats"]
                 grid["bars"] = edits.get("bars") or []
         except (OSError, json.JSONDecodeError):
-            pass
+            # Fall back to the detected grid rather than failing the export,
+            # but say so: silently ignoring this is how a user ends up asking
+            # why their grid edits disappeared.
+            logger.warning("ignoring unreadable beat edits for %s", job_id)
     return grid
 
 
