@@ -1912,6 +1912,12 @@ input, textarea { font-family: inherit; }
   flex: 0 0 auto;
   display: flex; flex-direction: column; align-items: center; gap: 6px;
   padding: 0 24px;
+  /* Wide enough that the transport grid below can give its two side tracks
+     equal width. Without a definite width the column shrink-wraps its content,
+     the empty spacer track collapses to zero, and the buttons end up offset by
+     the width of the loop-time fields (measured 109 px left of the tempo bar's
+     centre). */
+  min-width: min(30rem, 100%);
 }
 .footer-chips {
   flex: 1;
@@ -2016,16 +2022,32 @@ input, textarea { font-family: inherit; }
 .loop-time-input:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* Transport buttons */
+/* Three tracks: an empty spacer, the buttons, and the loop-time fields. The
+   two 1fr tracks take equal shares of the free space, so the middle track --
+   and therefore the play button -- lands exactly on the column's centre line,
+   in line with the tempo slider below it. */
 .footer-transport {
-  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
 }
-.footer-transport .daw-iconbtn.btn-transport {
+.footer-transport-spacer { min-width: 0; }
+.footer-transport-main {
+  display: flex; align-items: center; gap: 8px;
+  justify-self: center;
+}
+.footer-transport .footer-loop-times { justify-self: end; min-width: 0; }
+.footer-transport .daw-iconbtn.btn-transport,
+.footer-experimental .daw-iconbtn.btn-transport {
   background: var(--panel-2);
   border-color: var(--border-strong);
   color: var(--fg-2);
   transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
 }
-.footer-transport .daw-iconbtn.btn-transport:hover {
+.footer-transport .daw-iconbtn.btn-transport:hover,
+.footer-experimental .daw-iconbtn.btn-transport:hover {
   background: var(--panel-3);
   color: var(--fg);
 }
@@ -2042,6 +2064,141 @@ input, textarea { font-family: inherit; }
   border-color: rgba(74,140,255,0.55);
   color: #4a8cff;
 }
+
+/* Experimental features box, right-hand side of the footer. Visually set apart
+   so it reads as "not part of the normal transport". */
+.footer-experimental {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 10px 5px 9px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-2) 55%, transparent);
+  flex-shrink: 0;
+}
+.exp-label {
+  font-size: 9.5px; font-weight: 700; letter-spacing: 0.09em;
+  text-transform: uppercase; color: var(--muted);
+  white-space: nowrap; user-select: none;
+}
+/* The panel is anchored right here: centred on the button it would run off the
+   edge of the window in this position. */
+.footer-experimental .footer-metro-panel {
+  left: auto; right: -8px; transform: none;
+}
+
+/* Beat grid editor: canvas overlay + toolbar */
+.beatgrid-canvas {
+  position: absolute; inset: 0; z-index: 12;
+  pointer-events: none; /* enabled only while editing */
+}
+.beatgrid-canvas.hidden { display: none; }
+
+.beatgrid-toolbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 7px 10px; margin: 0 0 6px;
+  background: var(--panel-2); border: 1px solid var(--border-strong);
+  border-radius: 7px;
+}
+.beatgrid-toolbar.hidden { display: none; }
+.bg-tool-label {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.08em; color: var(--muted);
+}
+.bg-tools { display: flex; gap: 3px; }
+.bg-btn {
+  padding: 3px 9px;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: 5px; color: var(--fg-2); cursor: pointer;
+  font-family: inherit; font-size: 11px; font-weight: 600;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+.bg-btn:hover:not(:disabled) { background: var(--panel-3); color: var(--fg); }
+.bg-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.bg-btn.active {
+  background: rgba(74,140,255,0.16); border-color: rgba(74,140,255,0.55); color: #4a8cff;
+}
+.bg-btn.bg-primary {
+  background: rgba(232,200,64,0.16); border-color: rgba(232,200,64,0.5); color: var(--accent);
+}
+.bg-btn.bg-danger:hover { border-color: rgba(214,90,74,0.55); color: var(--danger); }
+.bg-check {
+  display: flex; align-items: center; gap: 4px;
+  font-size: 11px; font-weight: 600; color: var(--fg-2); cursor: pointer; user-select: none;
+}
+.bg-check input[type="checkbox"] { accent-color: var(--accent); cursor: pointer; }
+.bg-meter input[type="number"] {
+  width: 4ch; padding: 2px 4px;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: 4px; color: var(--fg);
+  font-family: inherit; font-size: 11px; font-weight: 600; text-align: center;
+}
+.bg-spacer { flex: 1; min-width: 8px; }
+.bg-hint { font-size: 10.5px; color: var(--muted); flex-basis: 100%; }
+
+/* Click track: toggle button + its options popover */
+.footer-metro-wrap { position: relative; display: flex; align-items: center; }
+.btn-transport.metro.active,
+.btn-transport.metro.active:hover {
+  background: rgba(74,140,255,0.16);
+  border-color: rgba(74,140,255,0.55);
+  color: #4a8cff;
+}
+.btn-transport.metro:disabled {
+  opacity: 0.4; cursor: not-allowed;
+}
+.footer-metro-panel {
+  position: absolute; bottom: calc(100% + 8px); left: 50%; transform: translateX(-50%);
+  z-index: 60; min-width: 210px;
+  display: flex; flex-direction: column; gap: 9px;
+  padding: 11px 12px;
+  background: var(--panel-2); border: 1px solid var(--border-strong);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.38);
+}
+.footer-metro-panel.hidden { display: none; }
+.metro-row { display: flex; align-items: center; gap: 9px; }
+.metro-label {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+  color: var(--muted); flex-shrink: 0; width: 52px;
+}
+.metro-row input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); }
+.metro-val {
+  font-size: 11px; color: var(--fg-2); width: 4ch; text-align: right;
+  font-variant-numeric: tabular-nums; flex-shrink: 0;
+}
+.metro-select {
+  flex: 1; padding: 3px 6px;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: 5px; color: var(--fg);
+  font-family: inherit; font-size: 12px; font-weight: 600; outline: none;
+}
+.metro-select:focus { border-color: var(--accent); }
+.metro-mult { display: flex; flex: 1; gap: 4px; }
+.metro-mult-btn {
+  flex: 1; padding: 3px 0;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: 5px; color: var(--fg-2); cursor: pointer;
+  font-family: inherit; font-size: 11px; font-weight: 700;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+.metro-mult-btn:hover { background: var(--panel-3); color: var(--fg); }
+.metro-mult-btn.active {
+  background: rgba(74,140,255,0.16); border-color: rgba(74,140,255,0.55); color: #4a8cff;
+}
+
+.metro-edit-btn {
+  padding: 4px 8px;
+  background: var(--panel); border: 1px solid var(--border-strong);
+  border-radius: 5px; color: var(--fg-2); cursor: pointer;
+  font-family: inherit; font-size: 11px; font-weight: 600;
+  transition: background var(--t-fast), border-color var(--t-fast), color var(--t-fast);
+}
+.metro-edit-btn:hover { background: var(--panel-3); color: var(--fg); }
+.metro-edit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Detection confidence / unavailability note. Hidden until it has text so the
+   panel does not carry an empty row in the normal case. */
+.metro-note { font-size: 10.5px; line-height: 1.35; color: var(--muted); }
+.metro-note:empty { display: none; }
+.metro-note.warn { color: var(--danger); }
 
 /* Tempo bar */
 .tempo-bar {
