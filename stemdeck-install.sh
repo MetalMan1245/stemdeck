@@ -198,6 +198,8 @@ Expected one or both of:
 
 select_install_location()
 {
+    local custom_base
+
     echo
     echo "Select installation type:"
     echo
@@ -207,9 +209,12 @@ select_install_location()
     echo "  2) Local"
     echo "     ${HOME}/.portable/"
     echo
+    echo "  3) Custom"
+    echo "     Specify an installation directory"
+    echo
 
     while true; do
-        read -r -p "Installation type [1-2] (default: 1): " choice
+        read -r -p "Installation type [1-3] (default: 1): " choice
 
         choice="${choice:-1}"
 
@@ -226,8 +231,33 @@ select_install_location()
                 break
                 ;;
 
+            3)
+                echo
+                read -r -p "Custom installation directory: " custom_base
+
+                # Remove trailing slashes so that the resulting path
+                # has exactly one separator before ARCHIVE_DIR.
+                custom_base="${custom_base%/}"
+
+                if [[ -z "$custom_base" ]]; then
+                    echo "A directory must be specified."
+                    continue
+                fi
+
+                # Expand a leading "~" if the user enters one.
+                if [[ "$custom_base" == "~" ]]; then
+                    custom_base="$HOME"
+                elif [[ "$custom_base" == "~/"* ]]; then
+                    custom_base="${HOME}/${custom_base#~/}"
+                fi
+
+                INSTALL_TYPE="Custom"
+                INSTALL_DIR="${custom_base}/${ARCHIVE_DIR}"
+                break
+                ;;
+
             *)
-                echo "Please enter 1 or 2."
+                echo "Please enter 1, 2, or 3."
                 ;;
         esac
     done
@@ -309,37 +339,37 @@ The archive contents may have changed."
     info "Found executable:"
     echo "     ${source_dir}/StemDeck"
 
-    # ------------------------------------------------------------------------
-    # Install application.
-    # ------------------------------------------------------------------------
+ # ------------------------------------------------------------------------
+# Install application.
+# ------------------------------------------------------------------------
 
-    info "Installing application to ${INSTALL_DIR}..."
+info "Installing application to ${INSTALL_DIR}..."
 
-    if [[ "$INSTALL_TYPE" == "Global" ]]; then
+if [[ "$INSTALL_TYPE" == "Global" ]]; then
 
-        run_privileged mkdir -p /opt
+    run_privileged mkdir -p "$(dirname "$INSTALL_DIR")"
 
-        run_privileged cp -a \
-            "$source_dir" \
-            "$INSTALL_DIR"
+    run_privileged cp -a \
+        "$source_dir" \
+        "$INSTALL_DIR"
 
-        run_privileged chmod +x \
-            "${INSTALL_DIR}/StemDeck"
+    run_privileged chmod +x \
+        "${INSTALL_DIR}/StemDeck"
 
-    else
+else
 
-        mkdir -p "${HOME}/.portable"
+    mkdir -p "$(dirname "$INSTALL_DIR")"
 
-        cp -a \
-            "$source_dir" \
-            "$INSTALL_DIR"
+    cp -a \
+        "$source_dir" \
+        "$INSTALL_DIR"
 
-        chmod +x \
-            "${INSTALL_DIR}/StemDeck"
+    chmod +x \
+        "${INSTALL_DIR}/StemDeck"
 
-    fi
+fi
 
-    INSTALLED_EXECUTABLE="${INSTALL_DIR}/StemDeck"
+INSTALLED_EXECUTABLE="${INSTALL_DIR}/StemDeck"
 
     # ------------------------------------------------------------------------
     # Install icon.
@@ -630,21 +660,25 @@ upgrade_stemdeck()
     # Preserve the existing installation type.
     INSTALL_TYPE="$old_install_type"
 
-    case "$INSTALL_TYPE" in
-        Global)
-            INSTALL_DIR="/opt/${ARCHIVE_DIR}"
-            ;;
+case "$INSTALL_TYPE" in
+    Global)
+        INSTALL_DIR="/opt/${ARCHIVE_DIR}"
+        ;;
 
-        Local)
-            INSTALL_DIR="${HOME}/.portable/${ARCHIVE_DIR}"
-            ;;
+    Local)
+        INSTALL_DIR="${HOME}/.portable/${ARCHIVE_DIR}"
+        ;;
 
-        *)
-            error "The existing StemDeck manifest contains an invalid installation type:
+    Custom)
+        INSTALL_DIR="$old_install_location"
+        ;;
+
+    *)
+        error "The existing StemDeck manifest contains an invalid installation type:
 
   ${INSTALL_TYPE:-<missing>}"
-            ;;
-    esac
+        ;;
+esac
 
     # ------------------------------------------------------------------------
     # Remove old application.
