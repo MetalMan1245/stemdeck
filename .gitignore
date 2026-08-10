@@ -82,3 +82,7 @@ Thumbs.db
 
 # Imported design references (kept local, not shipped)
 design/
+
+#Reference tarballs for installer testing
+StemDeck-Linux-x64.NVIDIA.tar.gz
+StemDeck-Linux-x64.tar.gz
